@@ -100,6 +100,49 @@ impl JoinCooldown {
     }
 }
 
+/// The origins whose Discovery requests this node answered and when. An origin is answered at most once per
+/// `discovery_cooldown_interval`, even when its identity claim has not changed: a known peer cannot force repeated
+/// signature checks, peer-DB writes, or outbound dials by streaming Discovery requests through relays, while an honest
+/// peer rediscovering this node with an unchanged claim is answered again once the cooldown passes. Past `capacity`
+/// origins, the least recently answered is forgotten first.
+#[derive(Debug, Default)]
+pub(super) struct DiscoveryCooldown {
+    answered: HashMap<CommsPublicKey, (Instant, u64)>,
+    /// The origins in the order they were last answered. The sequence number orders answers at the same instant.
+    by_age: BTreeMap<(Instant, u64), CommsPublicKey>,
+    next_seq: u64,
+}
+
+impl DiscoveryCooldown {
+    /// Returns true if a Discovery from `origin` was answered within `interval` of `now`.
+    pub fn in_cooldown(&self, origin: &CommsPublicKey, now: Instant, interval: Duration) -> bool {
+        self.answered
+            .get(origin)
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) < interval)
+    }
+
+    /// Admits and records a Discovery answer for `origin` at `now` unless one was already answered within `interval`.
+    /// Past `capacity` origins, the least recently answered is forgotten.
+    pub fn try_admit(&mut self, origin: &CommsPublicKey, now: Instant, interval: Duration, capacity: usize) -> bool {
+        if self.in_cooldown(origin, now, interval) {
+            return false;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if let Some(previous) = self.answered.insert(origin.clone(), (now, seq)) {
+            self.by_age.remove(&previous);
+        }
+        self.by_age.insert((now, seq), origin.clone());
+        while self.answered.len() > capacity {
+            let Some((_, oldest)) = self.by_age.pop_first() else {
+                break;
+            };
+            self.answered.remove(&oldest);
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod test {
     #![allow(clippy::indexing_slicing)]
@@ -172,6 +215,48 @@ mod test {
         assert!(!gate.propagated.contains_key(&origins[1]));
         assert!(gate.propagated.contains_key(&origins[0]));
         assert!(gate.propagated.contains_key(&origins[2]));
+        assert_eq!(gate.by_age.len(), 2);
+    }
+
+    #[test]
+    fn an_origin_is_answered_once_per_interval_and_again_after_expiry() {
+        let mut gate = DiscoveryCooldown::default();
+        let origin = make_node_identity().public_key().clone();
+        let other = make_node_identity().public_key().clone();
+        let interval = Duration::from_secs(60);
+        let start = Instant::now();
+
+        assert!(!gate.in_cooldown(&origin, start, interval));
+        assert!(gate.try_admit(&origin, start, interval, 10));
+        assert!(gate.in_cooldown(&origin, start, interval));
+        assert!(gate.in_cooldown(&origin, start + Duration::from_secs(59), interval));
+        assert!(!gate.try_admit(&origin, start + Duration::from_secs(59), interval, 10));
+        assert!(gate.try_admit(&other, start + Duration::from_secs(1), interval, 10));
+
+        let expired = start + interval;
+        assert!(!gate.in_cooldown(&origin, expired, interval));
+        assert!(gate.try_admit(&origin, expired, interval, 10));
+    }
+
+    #[test]
+    fn discovery_cooldown_forgets_least_recently_answered_origin_past_capacity() {
+        let mut gate = DiscoveryCooldown::default();
+        let origins = (0..3)
+            .map(|_| make_node_identity().public_key().clone())
+            .collect::<Vec<_>>();
+        let interval = Duration::from_secs(60);
+        let start = Instant::now();
+
+        assert!(gate.try_admit(&origins[0], start, interval, 2));
+        assert!(gate.try_admit(&origins[1], start + Duration::from_secs(1), interval, 2));
+        let later = start + interval + Duration::from_secs(1);
+        assert!(gate.try_admit(&origins[0], later, interval, 2));
+        assert!(gate.try_admit(&origins[2], later, interval, 2));
+
+        assert!(!gate.answered.contains_key(&origins[1]));
+        assert!(gate.answered.contains_key(&origins[0]));
+        assert!(gate.answered.contains_key(&origins[2]));
+        assert_eq!(gate.answered.len(), 2);
         assert_eq!(gate.by_age.len(), 2);
     }
 }
