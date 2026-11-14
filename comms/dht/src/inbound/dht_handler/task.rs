@@ -649,18 +649,20 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError>
             return Ok(());
         }
         let cooldown_interval = self.config.discovery_cooldown_interval;
-        if !self
-            .discovery_cooldown
-            .lock()
-            .is_ok_and(|gate| !gate.in_cooldown(authenticated_pk, Instant::now(), cooldown_interval))
-        {
+        let Some(discovery_lease) = DiscoveryCooldown::try_begin(
+            &self.discovery_cooldown,
+            authenticated_pk,
+            Instant::now(),
+            cooldown_interval,
+        ) else {
             debug!(
                 target: LOG_TARGET,
-                "A Discovery from '{authenticated_pk}' was answered within the last {cooldown_interval:.0?}. Dropping it."
+                "A Discovery from '{authenticated_pk}' is already in progress or was answered within the last \
+                 {cooldown_interval:.0?}. Dropping it."
             );
             discovery_received("cooldown");
             return Ok(());
-        }
+        };
 
         let node_id = NodeId::from_public_key(&new_peer.public_key);
 
@@ -730,14 +732,11 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError>
             return Ok(());
         }
 
-        if !self.discovery_cooldown.lock().is_ok_and(|mut gate| {
-            gate.try_admit(
-                authenticated_pk,
-                Instant::now(),
-                cooldown_interval,
-                self.config.discovery_cooldown_capacity,
-            )
-        }) {
+        if !discovery_lease.commit(
+            Instant::now(),
+            cooldown_interval,
+            self.config.discovery_cooldown_capacity,
+        ) {
             debug!(
                 target: LOG_TARGET,
                 "A Discovery from '{authenticated_pk}' was answered within the last {cooldown_interval:.0?}. Dropping it."
@@ -1485,7 +1484,8 @@ mod test {
         assert_eq!(after_expiry.outbound_sends, 1);
     }
 
-    /// Concurrent Discoveries from the same origin race cleanly and emit only a single DiscoveryResponse.
+    /// Concurrent Discoveries from the same origin reserve the origin before the first DB lookup, dropping duplicates
+    /// before claim validation and emitting only a single DiscoveryResponse.
     #[tokio::test]
     async fn concurrent_discoveries_from_the_same_origin_answer_at_most_once() {
         let handler = Handler::new(DhtConfig::default_local_test());
@@ -1496,6 +1496,11 @@ mod test {
         let results = futures::future::join_all((0..8u64).map(|nonce| {
             let mut msg = discovery_from(&signer);
             msg.nonce = nonce.saturating_add(1);
+            if nonce > 0 {
+                // Duplicates arriving while request 0 is in flight must drop before validate_peer (otherwise `signer`
+                // would be banned for the mismatched claim signature).
+                msg.addresses = vec!["/ip4/23.23.23.9/tcp/18189".parse::<Multiaddr>().unwrap().to_vec()];
+            }
             handler.process(make_message(&relay, &signer, DhtMessageType::Discovery, msg))
         }))
         .await;
