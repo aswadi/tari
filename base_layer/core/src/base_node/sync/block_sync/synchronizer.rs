@@ -21,7 +21,7 @@
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::{TryFrom, TryInto},
     future::Future,
     sync::Arc,
@@ -80,6 +80,8 @@ pub struct BlockSynchronizer<'a, B> {
     /// Time the current attempt has spent waiting on the network, which is what its budget bounds
     attempt_network_time: Duration,
     received_valid_block: bool,
+    /// Slow peers whose short ban is deferred while latency backoff retries remain active
+    deferred_slow_peers: Vec<(NodeId, BlockSyncError)>,
     /// When block sync attempts with each peer ended without a block or a ban, kept across sync rounds
     attempts_without_block: &'a mut HashMap<NodeId, Vec<Instant>>,
 }
@@ -105,6 +107,7 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
             predial_time: HashMap::new(),
             attempt_network_time: Duration::ZERO,
             received_valid_block: false,
+            deferred_slow_peers: Vec::new(),
             attempts_without_block,
         }
     }
@@ -125,6 +128,9 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
     }
 
     pub async fn synchronize(&mut self) -> Result<(), BlockSyncError> {
+        let mut seen_peers = HashSet::with_capacity(self.sync_peers.len());
+        self.sync_peers.retain(|peer| seen_peers.insert(peer.node_id().clone()));
+
         // Sync peers typically arrive here with a connection attached by header_sync (which
         // downgrades it to Weak on exit). Upgrade each in place to Strong for the duration of
         // block sync, or dial Strong if no connection is attached. The Strong handle pins the
@@ -185,6 +191,12 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
                 Ok(_) => return Ok(()),
                 Err(err @ BlockSyncError::AllSyncPeersExceedLatency) => {
                     warn!(target: LOG_TARGET, "{err}");
+                    latency_increases_counter = latency_increases_counter.saturating_add(1);
+                    // Prohibit using a few slow sync peers only, rather get new sync peers assigned
+                    if latency_increases_counter > MAX_LATENCY_INCREASES || self.sync_peers.len() < 2 {
+                        self.ban_deferred_slow_peers().await;
+                        return Err(err);
+                    }
                     max_latency = max_latency.saturating_add(self.config.max_latency_increase);
                     warn!(
                         target: LOG_TARGET,
@@ -192,21 +204,10 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
                         max_latency,
                         self.sync_peers.len()
                     );
-                    latency_increases_counter = latency_increases_counter.saturating_add(1);
-                    if latency_increases_counter > MAX_LATENCY_INCREASES {
-                        return Err(err);
-                    }
-                    // Prohibit using a few slow sync peers only, rather get new sync peers assigned
-                    if self.sync_peers.len() < 2 {
-                        return Err(err);
-                    } else {
-                        continue;
-                    }
                 },
                 Err(err @ BlockSyncError::SyncRoundFailed) => {
                     sync_round = sync_round.saturating_add(1);
                     warn!(target: LOG_TARGET, "{err} ({sync_round})");
-                    continue;
                 },
                 Err(err) => {
                     return Err(err);
@@ -217,6 +218,7 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
 
     #[allow(clippy::too_many_lines)]
     async fn attempt_block_sync(&mut self, max_latency: Duration) -> Result<(), BlockSyncError> {
+        self.deferred_slow_peers.clear();
         let mut sync_peer_node_ids = self.sync_peers.iter().map(|p| p.node_id()).cloned().collect::<Vec<_>>();
         // Peers whose recent attempts ended without a block go last
         prune_recent_outcomes(self.attempts_without_block);
@@ -333,31 +335,44 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
                 .get_mut(peer_index)
                 .expect("Already checked")
                 .set_latency(latency);
-            let sync_peer = self.sync_peers.get(peer_index).expect("Already checked").clone();
+            let mut sync_peer = self.sync_peers.get(peer_index).expect("Already checked").clone();
             let claimed_difficulty = sync_peer.claimed_chain_metadata().accumulated_difficulty();
+            let claimed_height = sync_peer.claimed_chain_metadata().best_block_height();
             info!(
                 target: LOG_TARGET,
                 "Attempting to synchronize blocks with `{node_id}` latency: {latency:.2?}"
             );
-            match self.synchronize_blocks(sync_peer, client, max_latency).await {
+            let sync_res = self.synchronize_blocks(&mut sync_peer, client, max_latency).await;
+            if let Some(slot) = self.sync_peers.get_mut(peer_index) {
+                *slot = sync_peer;
+            }
+            match sync_res {
                 Ok(_) => {
+                    self.deferred_slow_peers.clear();
                     self.attempts_without_block.remove(&node_id);
                     return Ok(());
+                },
+                Err(err @ BlockSyncError::MaxLatencyExceeded { .. }) => {
+                    warn!(target: LOG_TARGET, "{err}");
+                    if self.received_valid_block {
+                        self.attempts_without_block.remove(&node_id);
+                    }
+                    latency_counter = latency_counter.saturating_add(1);
+                    self.deferred_slow_peers.push((node_id, err));
                 },
                 Err(err) => {
                     self.ban_sync_peer(&node_id, &err).await;
                     if self.received_valid_block {
                         self.attempts_without_block.remove(&node_id);
-                    } else if self.sync_failure_is_peer_caused(&err, claimed_difficulty).await? {
+                    } else if self
+                        .sync_failure_is_peer_caused(&err, claimed_difficulty, claimed_height)
+                        .await?
+                    {
                         self.end_attempt_without_block(&node_id).await;
                     } else {
                         // Banned already, or a failure on our side or one the peer may not have caused
                     }
-                    if let BlockSyncError::MaxLatencyExceeded { .. } = err {
-                        latency_counter = latency_counter.saturating_add(1);
-                    } else {
-                        self.remove_sync_peer(&node_id);
-                    }
+                    self.remove_sync_peer(&node_id);
                 },
             }
         }
@@ -368,6 +383,14 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
             Err(BlockSyncError::AllSyncPeersExceedLatency)
         } else {
             Err(BlockSyncError::SyncRoundFailed)
+        }
+    }
+
+    async fn ban_deferred_slow_peers(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_slow_peers);
+        for (node_id, err) in deferred {
+            self.ban_sync_peer(&node_id, &err).await;
+            self.remove_sync_peer(&node_id);
         }
     }
 
@@ -406,11 +429,14 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
         &self,
         err: &BlockSyncError,
         claimed_difficulty: U512,
+        claimed_height: u64,
     ) -> Result<bool, BlockSyncError> {
         match err {
             BlockSyncError::PeerDoesNotHaveHeaderTipBlocks(_) => {
                 let header_tip = self.db.fetch_last_chain_header().await?;
-                Ok(claimed_difficulty >= header_tip.accumulated_data().total_accumulated_difficulty)
+                let tip_difficulty = header_tip.accumulated_data().total_accumulated_difficulty;
+                Ok(claimed_difficulty > tip_difficulty ||
+                    (claimed_difficulty == tip_difficulty && claimed_height >= header_tip.height()))
             },
             _ => Ok(false),
         }
@@ -430,7 +456,7 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
     #[allow(clippy::too_many_lines)]
     async fn synchronize_blocks(
         &mut self,
-        mut sync_peer: SyncPeer,
+        sync_peer: &mut SyncPeer,
         mut client: rpc::BaseNodeSyncRpcClient,
         max_latency: Duration,
     ) -> Result<(), BlockSyncError> {
@@ -473,13 +499,14 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
         let mut block_stream =
             match within_budget(&mut self.attempt_network_time, budget, client.sync_blocks(request)).await? {
                 Ok(stream) => stream,
-                Err(err) => return Err(self.not_found_before_first_block(err, &sync_peer, &tip_hash)),
+                Err(err) => return Err(self.not_found_before_first_block(err, sync_peer, &tip_hash)),
             };
         let mut prev_hash = best_full_block_hash;
         let mut current_block = None;
         let mut last_sync_timer = Instant::now();
         let mut avg_latency = RollingAverageTime::new(20);
         let mut received_block = false;
+        let mut reached_requested_tip = false;
         loop {
             let next = if self.received_valid_block {
                 block_stream.next().await
@@ -494,7 +521,7 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
             let block_body_response = match block_result {
                 Ok(response) => response,
                 Err(err) if !received_block => {
-                    return Err(self.not_found_before_first_block(err, &sync_peer, &tip_hash));
+                    return Err(self.not_found_before_first_block(err, sync_peer, &tip_hash));
                 },
                 Err(err) => return Err(err.into()),
             };
@@ -614,6 +641,9 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
                 .commit()
                 .await?;
             self.received_valid_block = true;
+            if header_hash == tip_hash {
+                reached_requested_tip = true;
+            }
 
             // Average time between receiving blocks from the peer - used to detect a slow sync peer
             let last_avg_latency = avg_latency.calculate_average_with_min_samples(5);
@@ -623,7 +653,7 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
             // Includes time to add block to database, used to show blocks/s on status line
             sync_peer.add_sample(last_sync_timer.elapsed());
             self.hooks
-                .call_on_progress_block_hooks(block.clone(), tip_height, &sync_peer);
+                .call_on_progress_block_hooks(block.clone(), tip_height, sync_peer);
 
             if let Some(avg_latency) = last_avg_latency &&
                 avg_latency > max_latency
@@ -655,14 +685,18 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
             metadata_after_sync.accumulated_difficulty(),
         );
 
-        // We asked for blocks up to our header tip, so a stream that ends cleanly below it was cut short by the peer
-        if metadata_after_sync.accumulated_difficulty() < tip_difficulty {
+        // We asked for blocks up to our header tip, so a stream that ends cleanly before delivering `tip_hash` was cut
+        // short by the peer — even when trailing headers do not increase `total_accumulated_difficulty` (e.g. C29
+        // blocks while `include_c29_accumulated_difficulty_into_total` is false).
+        if !reached_requested_tip || metadata_after_sync.accumulated_difficulty() < tip_difficulty {
             return Err(BlockSyncError::PeerDidNotSupplyAllRequestedBlocks(format!(
-                "Requested tip - height: {}, accumulated difficulty: {}. Our status after block sync - height: {}, \
-                 accumulated difficulty: {}",
+                "Requested tip - height: {}, hash: {}, accumulated difficulty: {}. Our status after block sync - \
+                 height: {}, hash: {}, accumulated difficulty: {}",
                 tip_height,
+                tip_hash.to_hex(),
                 tip_difficulty,
                 metadata_after_sync.best_block_height(),
+                metadata_after_sync.best_block_hash().to_hex(),
                 metadata_after_sync.accumulated_difficulty(),
             )));
         }
@@ -696,9 +730,7 @@ impl<'a, B: BlockchainBackend + 'static> BlockSynchronizer<'a, B> {
 
     // Sync peers are also removed from the list of sync peers if the ban duration is longer than the short ban period.
     fn remove_sync_peer(&mut self, node_id: &NodeId) {
-        if let Some(pos) = self.sync_peers.iter().position(|p| p.node_id() == node_id) {
-            self.sync_peers.remove(pos);
-        }
+        self.sync_peers.retain(|p| p.node_id() != node_id);
     }
 
     // Helper function to get the index to the node_id inside of the vec of peers
