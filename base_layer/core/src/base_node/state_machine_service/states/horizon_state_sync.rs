@@ -57,12 +57,6 @@ impl HorizonStateSync {
         };
 
         let sync_peers = &mut self.sync_peers;
-        // Order sync peers according to accumulated difficulty
-        sync_peers.sort_by(|a, b| {
-            b.claimed_chain_metadata()
-                .accumulated_difficulty()
-                .cmp(&a.claimed_chain_metadata().accumulated_difficulty())
-        });
 
         // Target horizon sync height based on the last header we have synced
         let last_header = match shared.db.fetch_last_header().await {
@@ -146,5 +140,80 @@ impl HorizonStateSync {
 impl From<Vec<SyncPeer>> for HorizonStateSync {
     fn from(sync_peers: Vec<SyncPeer>) -> Self {
         Self { sync_peers }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #![allow(clippy::indexing_slicing)]
+    use std::time::Duration;
+
+    use primitive_types::U512;
+    use tari_common_types::{chain_metadata::ChainMetadata, types::FixedHash};
+    use tari_comms::{peer_manager::NodeId, test_utils::mocks::create_connectivity_mock};
+    use tari_service_framework::reply_channel;
+    use tari_shutdown::Shutdown;
+    use tokio::sync::{broadcast, watch};
+
+    use super::*;
+    use crate::{
+        base_node::{
+            BaseNodeStateMachineConfig,
+            LocalNodeCommsInterface,
+            chain_metadata_service::PeerChainMetadata,
+            sync::SyncValidators,
+        },
+        proof_of_work::randomx_factory::RandomXFactory,
+        test_helpers::{blockchain::create_new_blockchain, create_consensus_rules, create_peer_manager},
+        validation::mocks::MockValidator,
+    };
+
+    fn make_peer(height: u64, difficulty: u64, latency: Option<Duration>) -> SyncPeer {
+        let metadata =
+            ChainMetadata::new(height, FixedHash::zero(), 0, 0, U512::from(difficulty), 0).expect("valid metadata");
+        SyncPeer::from(PeerChainMetadata::new(NodeId::new(), metadata, latency))
+    }
+
+    #[tokio::test]
+    async fn next_event_preserves_incoming_sync_peer_priority_order() {
+        let db = create_new_blockchain();
+        let (connectivity, _connectivity_mock) = create_connectivity_mock();
+        let (_metadata_tx, metadata_rx) = broadcast::channel(10);
+        let (_dht_tx, dht_rx) = broadcast::channel(10);
+        let (req_tx, _) = reply_channel::unbounded();
+        let (block_tx, _) = reply_channel::unbounded();
+        let (block_event_tx, _) = broadcast::channel(1);
+        let (status_tx, _status_rx) = watch::channel(StatusInfo::new());
+        let (event_tx, _event_rx) = broadcast::channel(10);
+        let shutdown = Shutdown::new();
+        let mut state_machine = BaseNodeStateMachine::new(
+            db.into(),
+            LocalNodeCommsInterface::new(req_tx, block_tx, block_event_tx),
+            connectivity,
+            metadata_rx,
+            create_peer_manager(),
+            dht_rx,
+            BaseNodeStateMachineConfig::default(),
+            SyncValidators::new(MockValidator::new(true), MockValidator::new(true)),
+            status_tx,
+            event_tx,
+            RandomXFactory::default(),
+            create_consensus_rules(),
+            shutdown.to_signal(),
+        );
+
+        let header_winner = make_peer(100, 150, Some(Duration::from_millis(15)));
+        let slow_higher_pow = make_peer(120, 200, Some(Duration::from_millis(900)));
+        let fast_tie = make_peer(100, 150, Some(Duration::from_millis(5)));
+
+        let mut horizon_sync =
+            HorizonStateSync::from(vec![header_winner.clone(), slow_higher_pow.clone(), fast_tie.clone()]);
+        let event = horizon_sync.next_event(&mut state_machine).await;
+        assert_eq!(event, StateEvent::HorizonStateSynchronized);
+
+        let peers = horizon_sync.into_sync_peers();
+        assert_eq!(peers[0].node_id(), header_winner.node_id());
+        assert_eq!(peers[1].node_id(), slow_higher_pow.node_id());
+        assert_eq!(peers[2].node_id(), fast_tie.node_id());
     }
 }

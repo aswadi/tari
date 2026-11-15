@@ -42,7 +42,7 @@ const LOG_TARGET: &str = "c::bn::header_sync";
 #[derive(Clone, Debug)]
 pub struct HeaderSyncState {
     sync_peers: Vec<SyncPeer>,
-    is_synced: bool,
+    header_sync_peer: Option<NodeId>,
     local_metadata: ChainMetadata,
 }
 
@@ -65,13 +65,31 @@ impl HeaderSyncState {
         });
         Self {
             sync_peers,
-            is_synced: false,
+            header_sync_peer: None,
             local_metadata,
         }
     }
 
-    pub fn is_synced(&self) -> bool {
-        self.is_synced
+    pub const fn is_synced(&self) -> bool {
+        false
+    }
+
+    pub(super) fn sync_peers(&self) -> &[SyncPeer] {
+        &self.sync_peers
+    }
+
+    pub(super) fn header_sync_peer(&self) -> Option<&NodeId> {
+        self.header_sync_peer.as_ref()
+    }
+
+    pub(super) fn promote_sync_peer_to_front(&mut self, sync_peer: &SyncPeer) {
+        if let Some(pos) = self.sync_peers.iter().position(|p| p == sync_peer) {
+            if pos > 0 {
+                let peer = self.sync_peers.remove(pos);
+                self.sync_peers.insert(0, peer);
+            }
+            self.header_sync_peer = Some(sync_peer.node_id().clone());
+        }
     }
 
     pub fn into_sync_peers(self) -> Vec<SyncPeer> {
@@ -178,13 +196,7 @@ impl HeaderSyncState {
                     timer.elapsed()
                 );
                 // Move the sync peer used in header sync to the front of the queue
-                if let Some(pos) = self.sync_peers.iter().position(|p| *p == sync_peer) &&
-                    pos > 0
-                {
-                    let sync_peer = self.sync_peers.remove(pos);
-                    self.sync_peers.insert(0, sync_peer);
-                }
-                self.is_synced = true;
+                self.promote_sync_peer_to_front(&sync_peer);
                 StateEvent::HeadersSynchronized(sync_peer, sync_result)
             },
             Err(err) => {
@@ -310,5 +322,29 @@ mod tests {
         assert_eq!(ordered[0].latency().map(|d| d.as_millis()), Some(5));
         assert!(ordered[1].latency().is_none());
         assert!(ordered[2].latency().is_none());
+    }
+
+    #[test]
+    fn promote_sync_peer_to_front_moves_winner_and_records_node_id() {
+        let slow_higher_pow = make_sync_peer(200, Some(Duration::from_millis(500)));
+        let fast_winner = make_sync_peer(150, Some(Duration::from_millis(10)));
+        let fallback = make_sync_peer(100, Some(Duration::from_millis(20)));
+
+        let local = make_chain_metadata(1);
+        let mut state = HeaderSyncState::new(
+            vec![fallback.clone(), fast_winner.clone(), slow_higher_pow.clone()],
+            local,
+        );
+        assert!(state.header_sync_peer().is_none());
+        assert_eq!(state.sync_peers()[0].node_id(), slow_higher_pow.node_id());
+
+        state.promote_sync_peer_to_front(&fast_winner);
+        assert_eq!(state.header_sync_peer(), Some(fast_winner.node_id()));
+        assert!(!state.is_synced());
+
+        let ordered = state.into_sync_peers();
+        assert_eq!(ordered[0].node_id(), fast_winner.node_id());
+        assert_eq!(ordered[1].node_id(), slow_higher_pow.node_id());
+        assert_eq!(ordered[2].node_id(), fallback.node_id());
     }
 }

@@ -21,6 +21,7 @@
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use log::*;
+use tari_common_types::chain_metadata::ChainMetadata;
 
 use crate::{
     base_node::{
@@ -35,15 +36,27 @@ use crate::{
 
 const LOG_TARGET: &str = "c::bn::state_machine_service::states::sync_decide";
 
+/// Returns true if `remote` has not pruned past our current local tip and can supply sequential full blocks above it.
+pub(super) fn can_sync_blocks_from(local: &ChainMetadata, remote: &ChainMetadata) -> bool {
+    remote.pruned_height() <= local.best_block_height()
+}
+
+/// Returns true if `local` is in pruned mode and `remote` is ahead of `local` while retaining at least
+/// `local.pruning_horizon()` full blocks above its `pruned_height`.
+pub(super) fn can_sync_horizon_from(local: &ChainMetadata, remote: &ChainMetadata) -> bool {
+    local.pruning_horizon() > 0 &&
+        remote.best_block_height() > local.best_block_height() &&
+        remote.best_block_height().saturating_sub(remote.pruned_height()) >= local.pruning_horizon()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecideNextSync {
     sync_peers: Vec<SyncPeer>,
-    is_synced: bool,
 }
 
 impl DecideNextSync {
-    pub fn is_synced(&self) -> bool {
-        self.is_synced
+    pub const fn is_synced(&self) -> bool {
+        false
     }
 
     pub async fn next_event<B: BlockchainBackend + 'static>(&mut self, shared: &BaseNodeStateMachine<B>) -> StateEvent {
@@ -70,12 +83,7 @@ impl DecideNextSync {
                 .filter(|sync_peer| {
                     let remote_metadata = sync_peer.claimed_chain_metadata();
                     debug!(target: LOG_TARGET, "Peer metadata: {remote_metadata}");
-                    // Must be able to provide the correct amount of full blocks past the pruned height (i.e. the
-                    // pruning horizon), otherwise our horizon spec will not be met
-                    remote_metadata.best_block_height().saturating_sub(remote_metadata.pruned_height()) >=
-                        local_metadata.pruning_horizon() &&
-                    // Must have a better blockchain tip than us
-                    remote_metadata.best_block_height() > local_metadata.best_block_height()
+                    can_sync_horizon_from(&local_metadata, remote_metadata)
                 })
                 .collect::<Vec<_>>();
 
@@ -129,7 +137,7 @@ impl DecideNextSync {
             .drain(..)
             .filter(|sync_peer| {
                 let remote_metadata = sync_peer.claimed_chain_metadata();
-                remote_metadata.pruned_height() <= local_metadata.best_block_height()
+                can_sync_blocks_from(&local_metadata, remote_metadata)
             })
             .collect::<Vec<_>>();
 
@@ -150,9 +158,196 @@ impl DecideNextSync {
 
 impl From<HeaderSyncState> for DecideNextSync {
     fn from(sync: HeaderSyncState) -> Self {
-        let is_synced = sync.is_synced();
+        let has_header_sync_peer = sync.header_sync_peer().is_some_and(|node_id| {
+            sync.sync_peers()
+                .first()
+                .is_some_and(|first| first.node_id() == node_id)
+        });
         let mut sync_peers = sync.into_sync_peers();
-        sync_peers.sort();
-        DecideNextSync { sync_peers, is_synced }
+        if has_header_sync_peer {
+            if let Some(fallback_peers) = sync_peers.get_mut(1..) {
+                fallback_peers.sort();
+            }
+        } else {
+            sync_peers.sort();
+        }
+        DecideNextSync { sync_peers }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #![allow(clippy::indexing_slicing)]
+    use std::time::Duration;
+
+    use primitive_types::U512;
+    use tari_common_types::types::FixedHash;
+    use tari_comms::{peer_manager::NodeId, test_utils::mocks::create_connectivity_mock};
+    use tari_service_framework::reply_channel;
+    use tari_shutdown::Shutdown;
+    use tokio::sync::{broadcast, watch};
+
+    use super::*;
+    use crate::{
+        base_node::{
+            BaseNodeStateMachineConfig,
+            LocalNodeCommsInterface,
+            chain_metadata_service::PeerChainMetadata,
+            state_machine_service::states::StatusInfo,
+            sync::SyncValidators,
+        },
+        chain_storage::{BlockchainDatabaseConfig, Validators},
+        proof_of_work::randomx_factory::RandomXFactory,
+        test_helpers::{
+            blockchain::{TempDatabase, create_new_blockchain, create_store_with_consensus_and_validators_and_config},
+            create_consensus_rules,
+            create_peer_manager,
+        },
+        validation::mocks::MockValidator,
+    };
+
+    fn make_metadata(height: u64, pruning_horizon: u64, pruned_height: u64, difficulty: u64) -> ChainMetadata {
+        ChainMetadata::new(
+            height,
+            FixedHash::zero(),
+            pruning_horizon,
+            pruned_height,
+            U512::from(difficulty),
+            0,
+        )
+        .expect("valid chain metadata")
+    }
+
+    fn make_sync_peer(metadata: ChainMetadata, latency: Option<Duration>) -> SyncPeer {
+        SyncPeer::from(PeerChainMetadata::new(NodeId::new(), metadata, latency))
+    }
+
+    fn make_state_machine(pruning_horizon: u64) -> BaseNodeStateMachine<TempDatabase> {
+        let db = if pruning_horizon == 0 {
+            create_new_blockchain()
+        } else {
+            let config = BlockchainDatabaseConfig {
+                pruning_horizon,
+                ..Default::default()
+            };
+            create_store_with_consensus_and_validators_and_config(
+                create_consensus_rules(),
+                Validators::new(
+                    MockValidator::new(true),
+                    MockValidator::new(true),
+                    MockValidator::new(true),
+                ),
+                config,
+            )
+        };
+        let (connectivity, _connectivity_mock) = create_connectivity_mock();
+        let (_metadata_tx, metadata_rx) = broadcast::channel(10);
+        let (_dht_tx, dht_rx) = broadcast::channel(10);
+        let (req_tx, _) = reply_channel::unbounded();
+        let (block_tx, _) = reply_channel::unbounded();
+        let (block_event_tx, _) = broadcast::channel(1);
+        let (status_tx, _status_rx) = watch::channel(StatusInfo::new());
+        let (event_tx, _event_rx) = broadcast::channel(10);
+        let shutdown = Shutdown::new();
+        BaseNodeStateMachine::new(
+            db.into(),
+            LocalNodeCommsInterface::new(req_tx, block_tx, block_event_tx),
+            connectivity,
+            metadata_rx,
+            create_peer_manager(),
+            dht_rx,
+            BaseNodeStateMachineConfig::default(),
+            SyncValidators::new(MockValidator::new(true), MockValidator::new(true)),
+            status_tx,
+            event_tx,
+            RandomXFactory::default(),
+            create_consensus_rules(),
+            shutdown.to_signal(),
+        )
+    }
+
+    #[test]
+    fn can_sync_blocks_and_horizon_predicates_match_pruned_and_archival_cases() {
+        let archival_local = make_metadata(10, 0, 0, 100);
+        let pruned_local = make_metadata(10, 50, 0, 100);
+
+        let pruned_above_tip = make_metadata(100, 0, 80, 1000);
+        assert!(!can_sync_blocks_from(&archival_local, &pruned_above_tip));
+        assert!(!can_sync_horizon_from(&archival_local, &pruned_above_tip));
+        assert!(!can_sync_blocks_from(&pruned_local, &pruned_above_tip));
+        assert!(!can_sync_horizon_from(&pruned_local, &pruned_above_tip));
+
+        let valid_horizon_peer = make_metadata(100, 50, 50, 1000);
+        assert!(!can_sync_blocks_from(&pruned_local, &valid_horizon_peer));
+        assert!(can_sync_horizon_from(&pruned_local, &valid_horizon_peer));
+
+        let tighter_horizon_but_has_blocks = make_metadata(25, 10, 10, 250);
+        assert!(can_sync_blocks_from(&pruned_local, &tighter_horizon_but_has_blocks));
+        assert!(!can_sync_horizon_from(&pruned_local, &tighter_horizon_but_has_blocks));
+    }
+
+    #[test]
+    fn from_header_sync_keeps_promoted_peer_ahead_of_higher_difficulty_fallback() {
+        let local = make_metadata(0, 0, 0, 1);
+        let slow_higher_pow = make_sync_peer(make_metadata(100, 0, 0, 500), Some(Duration::from_millis(800)));
+        let promoted_winner = make_sync_peer(make_metadata(90, 0, 0, 400), Some(Duration::from_millis(20)));
+        let fallback_slow = make_sync_peer(make_metadata(80, 0, 0, 300), Some(Duration::from_millis(90)));
+        let fallback_fast = make_sync_peer(make_metadata(80, 0, 0, 300), Some(Duration::from_millis(10)));
+
+        let mut header_sync = HeaderSyncState::new(
+            vec![
+                fallback_slow.clone(),
+                promoted_winner.clone(),
+                slow_higher_pow.clone(),
+                fallback_fast.clone(),
+            ],
+            local,
+        );
+        header_sync.promote_sync_peer_to_front(&promoted_winner);
+
+        let decide = DecideNextSync::from(header_sync);
+        assert!(!decide.is_synced());
+        assert_eq!(decide.sync_peers[0].node_id(), promoted_winner.node_id());
+        assert_eq!(decide.sync_peers[1].node_id(), slow_higher_pow.node_id());
+        assert_eq!(decide.sync_peers[2].node_id(), fallback_fast.node_id());
+        assert_eq!(decide.sync_peers[3].node_id(), fallback_slow.node_id());
+    }
+
+    #[tokio::test]
+    async fn decide_next_sync_returns_continue_and_stays_unsynced_when_peers_pruned_past_tip() {
+        let state_machine = make_state_machine(50);
+        let local = make_metadata(0, 50, 0, 1);
+        let unusable_peer = make_sync_peer(make_metadata(40, 20, 20, 400), Some(Duration::from_millis(10)));
+
+        let mut header_sync = HeaderSyncState::new(vec![unusable_peer.clone()], local);
+        header_sync.promote_sync_peer_to_front(&unusable_peer);
+
+        let mut decide = DecideNextSync::from(header_sync);
+        assert!(!decide.is_synced());
+        let event = decide.next_event(&state_machine).await;
+        assert_eq!(event, StateEvent::Continue);
+        assert!(!decide.is_synced());
+    }
+
+    #[tokio::test]
+    async fn decide_next_sync_keeps_promoted_peer_first_in_block_sync_peers() {
+        let state_machine = make_state_machine(0);
+        let local = make_metadata(0, 0, 0, 1);
+        let slow_higher_pow = make_sync_peer(make_metadata(50, 0, 0, 500), Some(Duration::from_millis(900)));
+        let promoted_winner = make_sync_peer(make_metadata(40, 0, 0, 400), Some(Duration::from_millis(15)));
+
+        let mut header_sync = HeaderSyncState::new(vec![slow_higher_pow.clone(), promoted_winner.clone()], local);
+        header_sync.promote_sync_peer_to_front(&promoted_winner);
+
+        let mut decide = DecideNextSync::from(header_sync);
+        let event = decide.next_event(&state_machine).await;
+        match event {
+            StateEvent::ProceedToBlockSync(peers) => {
+                assert_eq!(peers.len(), 2);
+                assert_eq!(peers[0].node_id(), promoted_winner.node_id());
+                assert_eq!(peers[1].node_id(), slow_higher_pow.node_id());
+            },
+            other => panic!("Expected ProceedToBlockSync, got {other:?}"),
+        }
     }
 }
