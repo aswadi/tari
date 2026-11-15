@@ -47,6 +47,7 @@ use crate::{
         error::{OutputManagerError, OutputManagerProtocolError, OutputManagerProtocolErrorExt},
         handle::{OutputManagerEvent, OutputManagerEventSender},
         storage::{
+            OutputStatus,
             database::{OutputManagerBackend, OutputManagerDatabase},
             models::DbWalletOutput,
             sqlite_db::{ReceivedOutputInfoForBatch, SpentOutputInfoForBatch},
@@ -55,6 +56,8 @@ use crate::{
 };
 
 const LOG_TARGET: &str = "wallet::output_service::txo_validation_task";
+/// Bounded retries when a new block arrives on the base node between its tip read and per-output reads.
+const MAX_ABOVE_TIP_QUERY_RETRIES: usize = 3;
 
 #[derive(Clone)]
 pub struct TxoValidationTask<TBackend, TWalletConnectivity, TKeyManagerInterface> {
@@ -73,10 +76,25 @@ struct MinedOutputInfo {
     mined_timestamp: u64,
 }
 
+#[derive(Clone, Copy)]
 enum DeletedOutputResolution {
     Unmined,
     MinedUnspent { found_height: u64, found_hash: FixedHash },
     MinedSpent { spent_height: u64, spent_hash: FixedHash },
+}
+
+enum ResponseValidationError {
+    AboveTip(&'static str),
+    Fatal(OutputManagerError),
+}
+
+impl ResponseValidationError {
+    fn into_output_manager_error(self) -> OutputManagerError {
+        match self {
+            Self::AboveTip(msg) => OutputManagerError::InconsistentBaseNodeDataError(msg),
+            Self::Fatal(err) => err,
+        }
+    }
 }
 
 impl<TBackend, TWalletConnectivity, TKeyManagerInterface>
@@ -134,7 +152,8 @@ where
 
         self.update_unconfirmed_outputs(&mut base_node_client).await?;
 
-        self.update_spent_outputs(&base_node_client, last_mined_header).await?;
+        self.update_spent_outputs(&mut base_node_client, last_mined_header)
+            .await?;
 
         self.update_invalid_outputs(&mut base_node_client).await?;
 
@@ -267,7 +286,7 @@ where
     #[allow(clippy::too_many_lines)]
     async fn update_spent_outputs(
         &self,
-        wallet_client: &TWalletConnectivity::BaseNodeClient,
+        wallet_client: &mut TWalletConnectivity::BaseNodeClient,
         last_mined_header: Option<(u64, BlockHash)>,
     ) -> Result<(), OutputManagerProtocolError> {
         let last_scanned_height = self
@@ -305,40 +324,24 @@ where
                 self.operation_id
             );
 
-            let (request_hashes, expected_hashes) = dedup_batch_hashes(batch);
-            let response = wallet_client
-                .query_deleted_utxos(request_hashes, must_include_header.clone())
+            let (resolutions, best_block_height) = self
+                .query_deleted_utxos_batch(batch, &must_include_header, wallet_client)
                 .await
-                .map_err(|e| {
-                    OutputManagerProtocolError::new(
-                        self.operation_id,
-                        OutputManagerError::BaseNodeClientError(format!("Error querying base node: {e}")),
-                    )
-                })?;
-
-            let by_hash = index_deleted_utxo_response(&expected_hashes, &response).for_protocol(self.operation_id)?;
+                .for_protocol(self.operation_id)?;
 
             let mut unmined_and_invalid = Vec::with_capacity(batch.len());
+            let mut remined_candidates = Vec::new();
             let mut unspent = Vec::with_capacity(batch.len());
             for output in batch {
-                let data = by_hash
+                let resolution = resolutions
                     .get(&output.hash)
                     .copied()
                     .ok_or(OutputManagerError::InconsistentBaseNodeDataError(
                         "Base node did not send back information for all utxos",
                     ))
                     .for_protocol(self.operation_id)?;
-                debug!(
-                    target: LOG_TARGET,
-                    "Processing output comm:{}: hash {}, found in height:{:?}, spent in height {:?} (Operation ID: {})",
-                    output.commitment.to_hex(),
-                    output.hash.to_hex(),
-                    data.found_in_header.as_ref().map(|h| h.0),
-                    data.spent_in_header.as_ref().map(|h| h.0),
-                    self.operation_id
-                );
 
-                match classify_deleted_utxo_info(data, response.best_block_height).for_protocol(self.operation_id)? {
+                match resolution {
                     DeletedOutputResolution::Unmined => {
                         unmined_and_invalid.push(output.hash);
                     },
@@ -363,8 +366,12 @@ where
                     } => {
                         if output.mined_height != Some(found_height) || output.mined_in_block != Some(found_hash) {
                             // Output was re-mined in a different block or height below the `check_for_reorgs` anchor;
-                            // invalidate it so `update_invalid_outputs` refreshes its block metadata under mask checks.
-                            unmined_and_invalid.push(output.hash);
+                            // refresh its mined metadata in place while preserving any pending input reservations.
+                            if blocks_revival(&self.key_manager, output, "TXO revalidation of re-mined outputs") {
+                                not_revivable = not_revivable.saturating_add(1);
+                            } else {
+                                remined_candidates.push(output.clone());
+                            }
                         } else if output.marked_deleted_at_height.is_some() {
                             // only update to unspent if the output is currently marked as spent in our db, and never if
                             // its commitment mask does not verify (the only move into a spendable status in this pass)
@@ -372,8 +379,7 @@ where
                                 not_revivable = not_revivable.saturating_add(1);
                             } else {
                                 let confirmed =
-                                    response
-                                        .best_block_height
+                                    best_block_height
                                         .checked_sub(found_height)
                                         .is_some_and(|confirmations| {
                                             confirmations >= self.config.num_confirmations_required
@@ -385,6 +391,10 @@ where
                         }
                     },
                 }
+            }
+            if !remined_candidates.is_empty() {
+                self.refresh_remined_outputs(&remined_candidates, &mut unmined_and_invalid, wallet_client)
+                    .await?;
             }
             if !unmined_and_invalid.is_empty() {
                 self.db
@@ -408,6 +418,85 @@ where
                  {})",
                 self.operation_id
             );
+        }
+        Ok(())
+    }
+
+    async fn query_deleted_utxos_batch(
+        &self,
+        batch: &[DbWalletOutput],
+        must_include_header: &[u8],
+        wallet_client: &TWalletConnectivity::BaseNodeClient,
+    ) -> Result<(HashMap<FixedHash, DeletedOutputResolution>, u64), OutputManagerError> {
+        let (request_hashes, expected_hashes) = dedup_batch_hashes(batch);
+        for attempt in 0..=MAX_ABOVE_TIP_QUERY_RETRIES {
+            let response = wallet_client
+                .query_deleted_utxos(request_hashes.clone(), must_include_header.to_vec())
+                .await
+                .map_err(|e| OutputManagerError::BaseNodeClientError(format!("Error querying base node: {e}")))?;
+
+            match parse_deleted_utxo_response(&expected_hashes, &response) {
+                Ok(resolutions) => return Ok((resolutions, response.best_block_height)),
+                Err(ResponseValidationError::AboveTip(reason)) if attempt < MAX_ABOVE_TIP_QUERY_RETRIES => {
+                    debug!(
+                        target: LOG_TARGET,
+                        "Retrying deleted UTXO query after block arrival during RPC ({reason}, attempt {}/{}, \
+                         Operation ID: {})",
+                        attempt.saturating_add(1),
+                        MAX_ABOVE_TIP_QUERY_RETRIES,
+                        self.operation_id
+                    );
+                },
+                Err(err) => return Err(err.into_output_manager_error()),
+            }
+        }
+        Err(OutputManagerError::InconsistentBaseNodeDataError(
+            "Base node reported height above tip",
+        ))
+    }
+
+    async fn refresh_remined_outputs(
+        &self,
+        remined_candidates: &[DbWalletOutput],
+        unmined_and_invalid: &mut Vec<FixedHash>,
+        wallet_client: &mut TWalletConnectivity::BaseNodeClient,
+    ) -> Result<(), OutputManagerProtocolError> {
+        let (mined, in_mempool, unmined, tip_height) = self
+            .query_base_node_for_outputs(remined_candidates, wallet_client)
+            .await
+            .for_protocol(self.operation_id)?;
+
+        if !mined.is_empty() {
+            let mined_updates: Vec<_> = mined
+                .iter()
+                .map(|mined_info| ReceivedOutputInfoForBatch {
+                    commitment: mined_info.output.commitment.clone(),
+                    mined_height: mined_info.mined_at_height,
+                    mined_in_block: mined_info.mined_block_hash,
+                    confirmed: tip_height
+                        .checked_sub(mined_info.mined_at_height)
+                        .is_some_and(|confirmations| confirmations >= self.config.num_confirmations_required),
+                    mined_timestamp: mined_info.mined_timestamp,
+                })
+                .collect();
+            self.db
+                .set_received_outputs_mined_height_and_statuses_guarded(
+                    mined_updates,
+                    revivable_commitments(remined_candidates),
+                )
+                .for_protocol(self.operation_id)?;
+        }
+
+        for uo in &in_mempool {
+            if !matches!(
+                uo.status,
+                OutputStatus::EncumberedToBeSpent | OutputStatus::ShortTermEncumberedToBeSpent
+            ) {
+                unmined_and_invalid.push(uo.hash);
+            }
+        }
+        for uo in &unmined {
+            unmined_and_invalid.push(uo.hash);
         }
         Ok(())
     }
@@ -712,12 +801,9 @@ where
             batch.iter().map(|o| o.hash.to_hex()).collect::<Vec<String>>()
         );
 
-        let batch_response = base_node_client
-            .get_utxos_mined_info(batch_hashes, 2)
-            .await
-            .map_err(|e| OutputManagerError::BaseNodeClientError(e.to_string()))?;
-
-        let (returned_outputs, mempool_set) = index_mined_utxo_response(&expected_hashes, &batch_response)?;
+        let (returned_outputs, mempool_set, best_block_height) = self
+            .query_mined_info_with_retry(&batch_hashes, &expected_hashes, base_node_client)
+            .await?;
 
         let mut mined = vec![];
         let mut in_mempool = vec![];
@@ -762,7 +848,41 @@ where
             unmined = still_unmined;
         }
 
-        Ok((mined, in_mempool, unmined, batch_response.best_block_height))
+        Ok((mined, in_mempool, unmined, best_block_height))
+    }
+
+    async fn query_mined_info_with_retry(
+        &self,
+        batch_hashes: &[Vec<u8>],
+        expected_hashes: &HashSet<FixedHash>,
+        base_node_client: &TWalletConnectivity::BaseNodeClient,
+    ) -> Result<(HashMap<FixedHash, (u64, FixedHash, u64)>, HashSet<FixedHash>, u64), OutputManagerError> {
+        for attempt in 0..=MAX_ABOVE_TIP_QUERY_RETRIES {
+            let batch_response = base_node_client
+                .get_utxos_mined_info(batch_hashes.to_vec(), 2)
+                .await
+                .map_err(|e| OutputManagerError::BaseNodeClientError(e.to_string()))?;
+
+            match index_mined_utxo_response(expected_hashes, &batch_response) {
+                Ok((returned_outputs, mempool_set)) => {
+                    return Ok((returned_outputs, mempool_set, batch_response.best_block_height));
+                },
+                Err(ResponseValidationError::AboveTip(reason)) if attempt < MAX_ABOVE_TIP_QUERY_RETRIES => {
+                    debug!(
+                        target: LOG_TARGET,
+                        "Retrying mined UTXO query after block arrival during RPC ({reason}, attempt {}/{}, Operation \
+                         ID: {})",
+                        attempt.saturating_add(1),
+                        MAX_ABOVE_TIP_QUERY_RETRIES,
+                        self.operation_id
+                    );
+                },
+                Err(err) => return Err(err.into_output_manager_error()),
+            }
+        }
+        Err(OutputManagerError::InconsistentBaseNodeDataError(
+            "Base node reported mined height above tip",
+        ))
     }
 
     /// Fallback: Check if the parent transaction of an encumbered output is still in the mempool
@@ -864,74 +984,108 @@ fn select_must_include_header(
         ))
 }
 
-fn index_deleted_utxo_response<'a>(
+fn parse_deleted_utxo_response(
     expected_hashes: &HashSet<FixedHash>,
-    response: &'a GetUtxosDeletedInfoResponse,
-) -> Result<HashMap<FixedHash, &'a DeletedUtxoInfo>, OutputManagerError> {
-    FixedHash::try_from(response.best_block_hash.as_slice())
-        .map_err(|_| OutputManagerError::InconsistentBaseNodeDataError("Base node sent malformed best block hash"))?;
-    validate_chain_height(response.best_block_height)?;
+    response: &GetUtxosDeletedInfoResponse,
+) -> Result<HashMap<FixedHash, DeletedOutputResolution>, ResponseValidationError> {
+    FixedHash::try_from(response.best_block_hash.as_slice()).map_err(|_| {
+        ResponseValidationError::Fatal(OutputManagerError::InconsistentBaseNodeDataError(
+            "Base node sent malformed best block hash",
+        ))
+    })?;
+    validate_chain_height(response.best_block_height).map_err(ResponseValidationError::Fatal)?;
 
     if response.utxos.len() != expected_hashes.len() {
-        return Err(OutputManagerError::InconsistentBaseNodeDataError(
-            "Base node did not send back information for all utxos",
+        return Err(ResponseValidationError::Fatal(
+            OutputManagerError::InconsistentBaseNodeDataError("Base node did not send back information for all utxos"),
         ));
     }
 
-    let mut by_hash = HashMap::with_capacity(response.utxos.len());
+    let mut resolutions = HashMap::with_capacity(response.utxos.len());
+    let mut above_tip_reason = None;
     for data in &response.utxos {
-        let utxo_hash = FixedHash::try_from(data.utxo_hash.as_slice())
-            .map_err(|_| OutputManagerError::InconsistentBaseNodeDataError("Base node sent malformed utxo hash"))?;
+        let utxo_hash = FixedHash::try_from(data.utxo_hash.as_slice()).map_err(|_| {
+            ResponseValidationError::Fatal(OutputManagerError::InconsistentBaseNodeDataError(
+                "Base node sent malformed utxo hash",
+            ))
+        })?;
         if !expected_hashes.contains(&utxo_hash) {
-            return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                "Base node sent unrequested utxo info",
+            return Err(ResponseValidationError::Fatal(
+                OutputManagerError::InconsistentBaseNodeDataError("Base node sent unrequested utxo info"),
             ));
         }
-        if by_hash.insert(utxo_hash, data).is_some() {
-            return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                "Base node sent duplicate utxo info",
+        let resolution = match classify_deleted_utxo_info(data, response.best_block_height) {
+            Ok(res) => res,
+            Err(ResponseValidationError::AboveTip(reason)) => {
+                above_tip_reason.get_or_insert(reason);
+                DeletedOutputResolution::Unmined
+            },
+            Err(fatal) => return Err(fatal),
+        };
+        if resolutions.insert(utxo_hash, resolution).is_some() {
+            return Err(ResponseValidationError::Fatal(
+                OutputManagerError::InconsistentBaseNodeDataError("Base node sent duplicate utxo info"),
             ));
         }
     }
-    Ok(by_hash)
+    if let Some(reason) = above_tip_reason {
+        return Err(ResponseValidationError::AboveTip(reason));
+    }
+    Ok(resolutions)
 }
 
 fn classify_deleted_utxo_info(
     data: &DeletedUtxoInfo,
     best_block_height: u64,
-) -> Result<DeletedOutputResolution, OutputManagerError> {
+) -> Result<DeletedOutputResolution, ResponseValidationError> {
     match (&data.found_in_header, &data.spent_in_header) {
         (None, None) => Ok(DeletedOutputResolution::Unmined),
-        (None, Some(_)) => Err(OutputManagerError::InconsistentBaseNodeDataError(
-            "Base node reported spent header without mined header",
+        (None, Some(_)) => Err(ResponseValidationError::Fatal(
+            OutputManagerError::InconsistentBaseNodeDataError("Base node reported spent header without mined header"),
         )),
         (Some((found_height, found_hash_bytes)), spent_in_header) => {
-            if *found_height > best_block_height {
-                return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                    "Base node reported mined height above tip",
-                ));
-            }
-            let found_hash = FixedHash::try_from(found_hash_bytes.as_slice())
-                .map_err(|_| OutputManagerError::InconsistentBaseNodeDataError("Base node sent malformed hash"))?;
+            validate_chain_height(*found_height).map_err(ResponseValidationError::Fatal)?;
+            let found_hash = FixedHash::try_from(found_hash_bytes.as_slice()).map_err(|_| {
+                ResponseValidationError::Fatal(OutputManagerError::InconsistentBaseNodeDataError(
+                    "Base node sent malformed hash",
+                ))
+            })?;
             match spent_in_header {
-                None => Ok(DeletedOutputResolution::MinedUnspent {
-                    found_height: *found_height,
-                    found_hash,
-                }),
+                None => {
+                    if *found_height > best_block_height {
+                        return Err(ResponseValidationError::AboveTip(
+                            "Base node reported mined height above tip",
+                        ));
+                    }
+                    Ok(DeletedOutputResolution::MinedUnspent {
+                        found_height: *found_height,
+                        found_hash,
+                    })
+                },
                 Some((spent_height, spent_hash_bytes)) => {
+                    validate_chain_height(*spent_height).map_err(ResponseValidationError::Fatal)?;
+                    let spent_hash = FixedHash::try_from(spent_hash_bytes.as_slice()).map_err(|_| {
+                        ResponseValidationError::Fatal(OutputManagerError::InconsistentBaseNodeDataError(
+                            "Base node sent malformed hash",
+                        ))
+                    })?;
                     if *spent_height < *found_height {
-                        return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                            "Base node reported spent height below mined height",
+                        return Err(ResponseValidationError::Fatal(
+                            OutputManagerError::InconsistentBaseNodeDataError(
+                                "Base node reported spent height below mined height",
+                            ),
+                        ));
+                    }
+                    if *found_height > best_block_height {
+                        return Err(ResponseValidationError::AboveTip(
+                            "Base node reported mined height above tip",
                         ));
                     }
                     if *spent_height > best_block_height {
-                        return Err(OutputManagerError::InconsistentBaseNodeDataError(
+                        return Err(ResponseValidationError::AboveTip(
                             "Base node reported spent height above tip",
                         ));
                     }
-                    let spent_hash = FixedHash::try_from(spent_hash_bytes.as_slice()).map_err(|_| {
-                        OutputManagerError::InconsistentBaseNodeDataError("Base node sent malformed hash")
-                    })?;
                     Ok(DeletedOutputResolution::MinedSpent {
                         spent_height: *spent_height,
                         spent_hash,
@@ -947,27 +1101,36 @@ type IndexedMinedOutputs = (HashMap<FixedHash, (u64, FixedHash, u64)>, HashSet<F
 fn index_mined_utxo_response(
     expected_hashes: &HashSet<FixedHash>,
     batch_response: &GetUtxosMinedInfoResponse,
-) -> Result<IndexedMinedOutputs, OutputManagerError> {
-    FixedHash::try_from(batch_response.best_block_hash.as_slice())
-        .map_err(|_| OutputManagerError::InconsistentBaseNodeDataError("Base node sent malformed best block hash"))?;
-    validate_chain_height(batch_response.best_block_height)?;
+) -> Result<IndexedMinedOutputs, ResponseValidationError> {
+    FixedHash::try_from(batch_response.best_block_hash.as_slice()).map_err(|_| {
+        ResponseValidationError::Fatal(OutputManagerError::InconsistentBaseNodeDataError(
+            "Base node sent malformed best block hash",
+        ))
+    })?;
+    validate_chain_height(batch_response.best_block_height).map_err(ResponseValidationError::Fatal)?;
 
     let mut returned_outputs = HashMap::with_capacity(batch_response.utxos.len());
+    let mut above_tip_reason = None;
     for mined_info in &batch_response.utxos {
-        let utxo_hash = FixedHash::try_from(mined_info.utxo_hash.as_slice())
-            .map_err(|_| OutputManagerError::InconsistentBaseNodeDataError("Base node sent malformed utxo hash"))?;
+        let utxo_hash = FixedHash::try_from(mined_info.utxo_hash.as_slice()).map_err(|_| {
+            ResponseValidationError::Fatal(OutputManagerError::InconsistentBaseNodeDataError(
+                "Base node sent malformed utxo hash",
+            ))
+        })?;
         if !expected_hashes.contains(&utxo_hash) {
-            return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                "Base node sent unrequested utxo info",
+            return Err(ResponseValidationError::Fatal(
+                OutputManagerError::InconsistentBaseNodeDataError("Base node sent unrequested utxo info"),
             ));
         }
+        validate_chain_height(mined_info.mined_in_height).map_err(ResponseValidationError::Fatal)?;
+        let mined_block_hash = FixedHash::try_from(mined_info.mined_in_hash.as_slice()).map_err(|_| {
+            ResponseValidationError::Fatal(OutputManagerError::InconsistentBaseNodeDataError(
+                "Base node sent malformed block hash",
+            ))
+        })?;
         if mined_info.mined_in_height > batch_response.best_block_height {
-            return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                "Base node reported mined height above tip",
-            ));
+            above_tip_reason.get_or_insert("Base node reported mined height above tip");
         }
-        let mined_block_hash = FixedHash::try_from(mined_info.mined_in_hash.as_slice())
-            .map_err(|_| OutputManagerError::InconsistentBaseNodeDataError("Base node sent malformed block hash"))?;
         if returned_outputs
             .insert(
                 utxo_hash,
@@ -979,8 +1142,8 @@ fn index_mined_utxo_response(
             )
             .is_some()
         {
-            return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                "Base node sent duplicate utxo info",
+            return Err(ResponseValidationError::Fatal(
+                OutputManagerError::InconsistentBaseNodeDataError("Base node sent duplicate utxo info"),
             ));
         }
     }
@@ -988,25 +1151,32 @@ fn index_mined_utxo_response(
     let mut mempool_set = HashSet::with_capacity(batch_response.mempool_utxos.len());
     for raw_hash in &batch_response.mempool_utxos {
         let utxo_hash = FixedHash::try_from(raw_hash.as_slice()).map_err(|_| {
-            OutputManagerError::InconsistentBaseNodeDataError("Base node sent malformed mempool utxo hash")
+            ResponseValidationError::Fatal(OutputManagerError::InconsistentBaseNodeDataError(
+                "Base node sent malformed mempool utxo hash",
+            ))
         })?;
         if !expected_hashes.contains(&utxo_hash) {
-            return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                "Base node sent unrequested mempool utxo",
+            return Err(ResponseValidationError::Fatal(
+                OutputManagerError::InconsistentBaseNodeDataError("Base node sent unrequested mempool utxo"),
             ));
         }
         if returned_outputs.contains_key(&utxo_hash) {
-            return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                "Base node reported utxo as both mined and in mempool",
+            return Err(ResponseValidationError::Fatal(
+                OutputManagerError::InconsistentBaseNodeDataError(
+                    "Base node reported utxo as both mined and in mempool",
+                ),
             ));
         }
         if !mempool_set.insert(utxo_hash) {
-            return Err(OutputManagerError::InconsistentBaseNodeDataError(
-                "Base node sent duplicate mempool utxo",
+            return Err(ResponseValidationError::Fatal(
+                OutputManagerError::InconsistentBaseNodeDataError("Base node sent duplicate mempool utxo"),
             ));
         }
     }
 
+    if let Some(reason) = above_tip_reason {
+        return Err(ResponseValidationError::AboveTip(reason));
+    }
     Ok((returned_outputs, mempool_set))
 }
 
@@ -1031,7 +1201,7 @@ fn revivable_hashes(outputs: &[DbWalletOutput]) -> Vec<FixedHash> {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Mutex;
+    use std::{collections::VecDeque, sync::Mutex};
 
     use anyhow::anyhow;
     use tari_common_sqlite::sqlite_connection_pool::PooledDbConnection;
@@ -1059,7 +1229,6 @@ mod test {
         connectivity_service::OnlineStatus,
         output_manager_service::storage::{
             OutputSource,
-            OutputStatus,
             sqlite_db::{NewOutputSql, OutputManagerSqliteDatabase},
         },
         schema::outputs,
@@ -1071,8 +1240,12 @@ mod test {
     struct MockNodeState {
         headers_by_height: HashMap<u64, BlockHash>,
         known_header_hashes: HashSet<BlockHash>,
+        mined_response_queue: VecDeque<GetUtxosMinedInfoResponse>,
+        deleted_response_queue: VecDeque<GetUtxosDeletedInfoResponse>,
         mined_response_override: Option<GetUtxosMinedInfoResponse>,
         deleted_response_override: Option<GetUtxosDeletedInfoResponse>,
+        mined_query_calls: usize,
+        deleted_query_calls: usize,
         mined_utxos: HashMap<FixedHash, MinedUtxoInfo>,
         spent_utxos: HashMap<FixedHash, (u64, Vec<u8>)>,
         best_block_height: u64,
@@ -1182,7 +1355,11 @@ mod test {
             hashes: Vec<Vec<u8>>,
             _version: u32,
         ) -> Result<GetUtxosMinedInfoResponse, anyhow::Error> {
-            let guard = self.state.lock().unwrap();
+            let mut guard = self.state.lock().unwrap();
+            guard.mined_query_calls = guard.mined_query_calls.saturating_add(1);
+            if let Some(queued) = guard.mined_response_queue.pop_front() {
+                return Ok(queued);
+            }
             if let Some(override_resp) = &guard.mined_response_override {
                 return Ok(override_resp.clone());
             }
@@ -1209,6 +1386,7 @@ mod test {
             must_include_header: Vec<u8>,
         ) -> Result<GetUtxosDeletedInfoResponse, anyhow::Error> {
             let mut guard = self.state.lock().unwrap();
+            guard.deleted_query_calls = guard.deleted_query_calls.saturating_add(1);
             guard.observed_must_include_headers.push(must_include_header.clone());
             if guard.enforce_must_include_header {
                 let header_hash = FixedHash::try_from(must_include_header.as_slice())
@@ -1216,6 +1394,9 @@ mod test {
                 if !guard.known_header_hashes.contains(&header_hash) {
                     return Err(anyhow!("HeaderHashNotFound"));
                 }
+            }
+            if let Some(queued) = guard.deleted_response_queue.pop_front() {
+                return Ok(queued);
             }
             if let Some(override_resp) = &guard.deleted_response_override {
                 return Ok(override_resp.clone());
@@ -1700,7 +1881,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn shallow_reorg_below_anchor_refreshes_canonical_block_metadata() {
+    async fn shallow_reorg_below_anchor_refreshes_metadata_and_preserves_reservations() {
         let harness = TestHarness::new().await;
         let stale_fork5 = FixedHash::from([0xF5; 32]);
         let canonical6 = FixedHash::from([0x06; 32]);
@@ -1709,22 +1890,131 @@ mod test {
         harness.client.set_tip(20, canonical20);
 
         let earlier = harness.insert_output(3_000, OutputStatus::Unspent, Some((5, stale_fork5)), None);
+        let reserved = harness.insert_output(4_000, OutputStatus::EncumberedToBeSpent, Some((5, stale_fork5)), None);
+        let short_term_reserved = harness.insert_output(
+            4_500,
+            OutputStatus::ShortTermEncumberedToBeSpent,
+            Some((5, stale_fork5)),
+            None,
+        );
         let anchor = harness.insert_output(6_000, OutputStatus::Unspent, Some((20, canonical20)), None);
-        harness
-            .client
-            .set_mined_output(earlier.hash, 6, canonical6, 1_700_000_600);
+        for hash in [earlier.hash, reserved.hash, short_term_reserved.hash] {
+            harness.client.set_mined_output(hash, 6, canonical6, 1_700_000_600);
+        }
         harness
             .client
             .set_mined_output(anchor.hash, 20, canonical20, 1_700_002_000);
 
         harness.make_task(30).execute().await.unwrap();
 
-        // `check_for_reorgs` anchored on `canonical20`, and `earlier` was refreshed from `(5, stale_fork5)` to `(6,
-        // canonical6)`.
+        // `check_for_reorgs` anchored on `canonical20`, and all re-mined outputs refreshed to `(6, canonical6)`
+        // without dropping pending input reservations (`EncumberedToBeSpent` / `ShortTermEncumberedToBeSpent`).
         assert_eq!(harness.client.take_must_include_headers(), vec![canonical20.to_vec()]);
         let refreshed = harness.stored_output(&earlier.commitment);
         assert_eq!(refreshed.status, OutputStatus::Unspent);
         assert_eq!(refreshed.mined_height, Some(6));
         assert_eq!(refreshed.mined_in_block, Some(canonical6));
+
+        let refreshed_reserved = harness.stored_output(&reserved.commitment);
+        assert_eq!(refreshed_reserved.status, OutputStatus::EncumberedToBeSpent);
+        assert_eq!(refreshed_reserved.mined_height, Some(6));
+        assert_eq!(refreshed_reserved.mined_in_block, Some(canonical6));
+
+        let refreshed_short_term = harness.stored_output(&short_term_reserved.commitment);
+        assert_eq!(refreshed_short_term.status, OutputStatus::ShortTermEncumberedToBeSpent);
+        assert_eq!(refreshed_short_term.mined_height, Some(6));
+        assert_eq!(refreshed_short_term.mined_in_block, Some(canonical6));
+    }
+
+    #[tokio::test]
+    async fn retries_above_tip_race_on_block_arrival_and_fails_when_persistent() {
+        let mut harness = TestHarness::new().await;
+        harness.config.num_confirmations_required = 0;
+        let block19 = FixedHash::from([0x19; 32]);
+        let block20 = FixedHash::from([0x20; 32]);
+        let block21 = FixedHash::from([0x21; 32]);
+        harness.client.insert_canonical_block(19, block19);
+        harness.client.insert_canonical_block(20, block20);
+        harness.client.set_tip(21, block21);
+        harness.set_last_scanned_height(21, block21);
+
+        let pending = harness.insert_output(2_500, OutputStatus::EncumberedToBeReceived, None, None);
+        {
+            let mut state = harness.client.state.lock().unwrap();
+            // Simulate block 20 arriving mid-query in `get_utxos_mined_info`, then succeeding on retry.
+            state.mined_response_queue.push_back(GetUtxosMinedInfoResponse {
+                utxos: vec![MinedUtxoInfo {
+                    utxo_hash: pending.hash.to_vec(),
+                    mined_in_hash: block20.to_vec(),
+                    mined_in_height: 20,
+                    mined_in_timestamp: 1_700_002_000,
+                }],
+                best_block_hash: block19.to_vec(),
+                best_block_height: 19,
+                mempool_utxos: Vec::new(),
+            });
+            state.mined_response_queue.push_back(GetUtxosMinedInfoResponse {
+                utxos: vec![MinedUtxoInfo {
+                    utxo_hash: pending.hash.to_vec(),
+                    mined_in_hash: block20.to_vec(),
+                    mined_in_height: 20,
+                    mined_in_timestamp: 1_700_002_000,
+                }],
+                best_block_hash: block20.to_vec(),
+                best_block_height: 20,
+                mempool_utxos: Vec::new(),
+            });
+            // Simulate block 21 arriving mid-query in `query_deleted_utxos`, then succeeding on retry.
+            state.deleted_response_queue.push_back(GetUtxosDeletedInfoResponse {
+                utxos: vec![DeletedUtxoInfo {
+                    utxo_hash: pending.hash.to_vec(),
+                    found_in_header: Some((20, block20.to_vec())),
+                    spent_in_header: Some((21, block21.to_vec())),
+                }],
+                best_block_hash: block20.to_vec(),
+                best_block_height: 20,
+            });
+            state.deleted_response_queue.push_back(GetUtxosDeletedInfoResponse {
+                utxos: vec![DeletedUtxoInfo {
+                    utxo_hash: pending.hash.to_vec(),
+                    found_in_header: Some((20, block20.to_vec())),
+                    spent_in_header: Some((21, block21.to_vec())),
+                }],
+                best_block_hash: block21.to_vec(),
+                best_block_height: 21,
+            });
+        }
+
+        harness.make_task(31).execute().await.unwrap();
+        assert_eq!(harness.stored_output(&pending.commitment).status, OutputStatus::Spent);
+        assert_eq!(harness.client.state.lock().unwrap().mined_query_calls, 2);
+        assert_eq!(harness.client.state.lock().unwrap().deleted_query_calls, 2);
+
+        // Persistent above-tip replies still fail closed after bounded retries (`MAX_ABOVE_TIP_QUERY_RETRIES + 1`).
+        let unconfirmed = harness.insert_output(1_500, OutputStatus::EncumberedToBeReceived, None, None);
+        {
+            let mut state = harness.client.state.lock().unwrap();
+            state.mined_query_calls = 0;
+            state.mined_response_override = Some(GetUtxosMinedInfoResponse {
+                utxos: vec![MinedUtxoInfo {
+                    utxo_hash: unconfirmed.hash.to_vec(),
+                    mined_in_hash: block21.to_vec(),
+                    mined_in_height: 22,
+                    mined_in_timestamp: 0,
+                }],
+                best_block_hash: block21.to_vec(),
+                best_block_height: 21,
+                mempool_utxos: Vec::new(),
+            });
+        }
+        let err = harness.make_task(32).execute().await.unwrap_err();
+        assert!(matches!(
+            err.error,
+            OutputManagerError::InconsistentBaseNodeDataError(_)
+        ));
+        assert_eq!(
+            harness.client.state.lock().unwrap().mined_query_calls,
+            MAX_ABOVE_TIP_QUERY_RETRIES.saturating_add(1)
+        );
     }
 }

@@ -130,11 +130,14 @@ impl OutputManagerSqliteDatabase {
 impl OutputManagerSqliteDatabase {
     /// Batch upsert of received outputs' mined data and status. With `revivable` set, a row that is currently
     /// `Invalid` is only updated if its commitment is listed, so a status written concurrently (e.g. by the commitment
-    /// mask migration) after the caller read the output is not overwritten.
+    /// mask migration) after the caller read the output is not overwritten. With `preserve_spend_encumbrances` set,
+    /// rows reserved for a pending outbound payment (`EncumberedToBeSpent` or `ShortTermEncumberedToBeSpent`) keep
+    /// their reservation status while refreshing mined metadata.
     fn set_received_outputs_mined_height_and_statuses_impl(
         &self,
         updates: Vec<ReceivedOutputInfoForBatch>,
         revivable: Option<&[CompressedCommitment]>,
+        preserve_spend_encumbrances: bool,
     ) -> Result<(), OutputManagerStorageError> {
         let start = Instant::now();
         let mut conn = self.database_connection.get_pooled_connection()?;
@@ -193,11 +196,20 @@ impl OutputManagerSqliteDatabase {
                 .join(", "),
         );
 
-        query.push_str(
+        let status_expr = if preserve_spend_encumbrances {
+            format!(
+                "CASE WHEN outputs.status IN ({}, {}) THEN outputs.status ELSE excluded.status END",
+                OutputStatus::EncumberedToBeSpent as i32,
+                OutputStatus::ShortTermEncumberedToBeSpent as i32,
+            )
+        } else {
+            "excluded.status".to_string()
+        };
+        query.push_str(&format!(
             " ON CONFLICT (commitment) DO UPDATE SET mined_height = excluded.mined_height, mined_in_block = \
-             excluded.mined_in_block, status = excluded.status, mined_timestamp = excluded.mined_timestamp, \
+             excluded.mined_in_block, status = {status_expr}, mined_timestamp = excluded.mined_timestamp, \
              marked_deleted_at_height = NULL, marked_deleted_in_block = NULL, last_validation_timestamp = NULL",
-        );
+        ));
         if let Some(revivable) = revivable {
             query.push_str(&format!(" WHERE outputs.status != {}", OutputStatus::Invalid as i32));
             if !revivable.is_empty() {
@@ -698,7 +710,7 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
         &self,
         updates: Vec<ReceivedOutputInfoForBatch>,
     ) -> Result<(), OutputManagerStorageError> {
-        self.set_received_outputs_mined_height_and_statuses_impl(updates, None)
+        self.set_received_outputs_mined_height_and_statuses_impl(updates, None, false)
     }
 
     fn set_received_outputs_mined_height_and_statuses_guarded(
@@ -706,7 +718,7 @@ impl OutputManagerBackend for OutputManagerSqliteDatabase {
         updates: Vec<ReceivedOutputInfoForBatch>,
         revivable: Vec<CompressedCommitment>,
     ) -> Result<(), OutputManagerStorageError> {
-        self.set_received_outputs_mined_height_and_statuses_impl(updates, Some(&revivable))
+        self.set_received_outputs_mined_height_and_statuses_impl(updates, Some(&revivable), true)
     }
 
     fn set_outputs_to_unmined_and_invalid(&self, hashes: Vec<FixedHash>) -> Result<(), OutputManagerStorageError> {
