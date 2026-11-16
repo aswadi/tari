@@ -39,9 +39,14 @@ const LOG_TARGET: &str = "c::mempool::rpc";
 /// Maximum number of inbound P2P `submit_transaction` RPC requests being converted or submitted at once.
 pub(super) const MAX_CONCURRENT_RPC_SUBMISSIONS: usize = 2;
 
+#[cfg(test)]
+type ConversionHook = Arc<dyn Fn() + Send + Sync>;
+
 pub struct MempoolRpcService {
     mempool: MempoolHandle,
     submission_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    conversion_hook: Option<ConversionHook>,
 }
 
 impl MempoolRpcService {
@@ -49,6 +54,8 @@ impl MempoolRpcService {
         Self {
             mempool,
             submission_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_RPC_SUBMISSIONS)),
+            #[cfg(test)]
+            conversion_hook: None,
         }
     }
 
@@ -60,6 +67,12 @@ impl MempoolRpcService {
     #[cfg(test)]
     pub(super) fn submission_permits(&self) -> Arc<Semaphore> {
         self.submission_permits.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_conversion_hook(mut self, hook: ConversionHook) -> Self {
+        self.conversion_hook = Some(hook);
+        self
     }
 }
 
@@ -122,7 +135,13 @@ impl MempoolService for MempoolRpcService {
             .acquire_owned()
             .await
             .map_err(to_internal_error)?;
+        #[cfg(test)]
+        let conversion_hook = self.conversion_hook.clone();
         let (_permit, conversion) = task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = conversion_hook {
+                hook();
+            }
             let result = Transaction::try_from(message);
             (permit, result)
         })

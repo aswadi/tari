@@ -314,6 +314,100 @@ mod submit_transaction {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_during_conversion_keeps_its_slot_until_conversion_finishes() {
+        use std::sync::{
+            Condvar,
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[derive(Default)]
+        struct ConversionGate {
+            entered: AtomicUsize,
+            closed: Mutex<bool>,
+            cv: Condvar,
+        }
+
+        impl ConversionGate {
+            fn set_closed(&self, is_closed: bool) {
+                *self.closed.lock().unwrap() = is_closed;
+                self.cv.notify_all();
+            }
+        }
+
+        struct OpenOnDrop(Arc<ConversionGate>);
+        impl Drop for OpenOnDrop {
+            fn drop(&mut self) {
+                self.0.set_closed(false);
+            }
+        }
+
+        let gate = Arc::new(ConversionGate::default());
+        gate.set_closed(true);
+        let _open_on_drop = OpenOnDrop(gate.clone());
+
+        let (service, mempool, req_mock) = setup();
+        mempool
+            .set_submit_transaction_response(TxStorageResponse::UnconfirmedPool)
+            .await;
+        let hook_gate = gate.clone();
+        let service = Arc::new(service.with_conversion_hook(Arc::new(move || {
+            hook_gate.entered.fetch_add(1, Ordering::SeqCst);
+            let mut closed = hook_gate.closed.lock().unwrap();
+            while *closed {
+                closed = hook_gate.cv.wait(closed).unwrap();
+            }
+        })));
+
+        // Hold all but one slot so the gated conversion occupies the final free slot.
+        let held = service
+            .submission_permits()
+            .acquire_many_owned(u32::try_from(MAX_CONCURRENT_RPC_SUBMISSIONS.saturating_sub(1)).unwrap())
+            .await
+            .unwrap();
+
+        let in_flight_req = req_mock.request_with_context(Default::default(), valid_proto_tx());
+        let in_flight = tokio::spawn({
+            let service = service.clone();
+            async move { service.submit_transaction(in_flight_req).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gate.entered.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("conversion did not start");
+
+        // Cancel the RPC call while conversion is still running on the blocking thread.
+        in_flight.abort();
+        let _aborted = in_flight.await;
+
+        // Its permit remains occupied while the blocking conversion has not finished, blocking a newcomer.
+        assert_eq!(service.submission_permits().available_permits(), 0);
+        let next_req = req_mock.request_with_context(Default::default(), valid_proto_tx());
+        let next = tokio::spawn({
+            let service = service.clone();
+            async move { service.submit_transaction(next_req).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gate.entered.load(Ordering::SeqCst), 1);
+        assert!(!next.is_finished());
+
+        // Once conversion finishes, the cancelled request never submits to the mempool, frees its slot, and `next`
+        // completes normally.
+        gate.set_closed(false);
+        next.await.unwrap().unwrap();
+        assert_eq!(gate.entered.load(Ordering::SeqCst), 2);
+        assert_eq!(mempool.get_call_count(), 1);
+        drop(held);
+        assert_eq!(
+            service.submission_permits().available_permits(),
+            MAX_CONCURRENT_RPC_SUBMISSIONS
+        );
+    }
+
     #[tokio::test]
     async fn it_errors_on_invalid_transaction() {
         let (service, _, req_mock) = setup();
