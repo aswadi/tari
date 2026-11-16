@@ -26,6 +26,7 @@ use std::sync::{
 };
 
 use futures::StreamExt;
+use tari_comms::peer_manager::NodeId;
 use tari_service_framework::reply_channel;
 use tari_transaction_components::transaction_components::Transaction;
 use tokio::{sync::Mutex, task};
@@ -52,6 +53,7 @@ pub struct MempoolMockState {
     get_tx_state_by_excess_sig: Arc<Mutex<TxStorageResponse>>,
     submit_transaction: Arc<Mutex<TxStorageResponse>>,
     submitted_transactions: Arc<Mutex<Vec<Transaction>>>,
+    submitted_transaction_peers: Arc<Mutex<Vec<Option<NodeId>>>>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -66,6 +68,7 @@ impl Default for MempoolMockState {
             get_tx_state_by_excess_sig: Arc::new(Mutex::new(TxStorageResponse::NotStored(None))),
             submit_transaction: Arc::new(Mutex::new(TxStorageResponse::NotStored(None))),
             submitted_transactions: Arc::new(Mutex::new(Vec::new())),
+            submitted_transaction_peers: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(Default::default()),
         }
     }
@@ -87,6 +90,11 @@ impl MempoolMockState {
     /// Every transaction submitted to the mock, in order
     pub async fn submitted_transactions(&self) -> Vec<Transaction> {
         self.submitted_transactions.lock().await.clone()
+    }
+
+    /// Source peer (if any) recorded for each submitted transaction, in order
+    pub async fn submitted_transaction_peers(&self) -> Vec<Option<NodeId>> {
+        self.submitted_transaction_peers.lock().await.clone()
     }
 
     fn inc_call_count(&self) {
@@ -130,6 +138,7 @@ impl MempoolServiceMock {
             GetStats,
             GetTxStateByExcessSig,
             SubmitTransaction,
+            SubmitTransactionFromPeer,
         };
 
         self.state.inc_call_count();
@@ -144,6 +153,18 @@ impl MempoolServiceMock {
             )),
             SubmitTransaction(tx) => {
                 self.state.submitted_transactions.lock().await.push(tx);
+                self.state.submitted_transaction_peers.lock().await.push(None);
+                Ok(MempoolResponse::TxStorage(
+                    self.state.submit_transaction.lock().await.clone(),
+                ))
+            },
+            SubmitTransactionFromPeer { tx, source_peer } => {
+                self.state.submitted_transactions.lock().await.push(tx);
+                self.state
+                    .submitted_transaction_peers
+                    .lock()
+                    .await
+                    .push(Some(source_peer));
                 Ok(MempoolResponse::TxStorage(
                     self.state.submit_transaction.lock().await.clone(),
                 ))
